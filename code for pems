@@ -1,0 +1,130 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_BMP280.h>
+#include <math.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+Adafruit_BMP280 bmp; 
+const int MQ135_PIN = 34;
+const int MIC_PIN = 35;
+
+float currentTemp = 0, currentDB = 0, cumulativeRisk = 0;
+int currentAQI = 0, exposureScore = 0;
+unsigned long previousMillis = 0;
+unsigned long highExposureStartMillis = 0;
+bool inHighExposure = false;
+
+unsigned long sequencerStart = 0;
+const long cycleTotal = 30000; 
+
+const float NOISE_OFFSET = 34.0; 
+const float TEMP_OFFSET = 2.0;
+
+// --- AQI MAPPING (PRESERVED) ---
+int getCalibratedAQI(int raw) {
+  if (raw <= 1000)      return map(raw, 0, 1000, 20, 50);      
+  else if (raw <= 1300) return map(raw, 1001, 1300, 51, 100);
+  else                  return map(raw, 1301, 4095, 101, 500);
+}
+
+// --- NOISE CALCULATION (PRESERVED) ---
+float getDecibels() {
+  unsigned int sampleWindow = 50; 
+  unsigned long startMillis = millis();
+  unsigned int signalMax = 0, signalMin = 4095;
+  while (millis() - startMillis < sampleWindow) {
+    unsigned int sample = analogRead(MIC_PIN);
+    if (sample < 4095) {
+      if (sample > signalMax) signalMax = sample;
+      else if (sample < signalMin) signalMin = sample;
+    }
+  }
+  float volts = ((signalMax - signalMin) * 3.3) / 4095; 
+  float db = 20 * log10(volts / 0.00632) + 40 - NOISE_OFFSET;
+  return (db < 35) ? 35 : db;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
+  bmp.begin(0x76);
+  
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setCursor(20, 25);
+  display.println("V4.0 PRECISE");
+  display.display();
+  delay(2000);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= 5000) {
+    previousMillis = currentMillis;
+
+    currentTemp = bmp.readTemperature() + TEMP_OFFSET;
+    currentAQI  = getCalibratedAQI(analogRead(MQ135_PIN));
+    currentDB   = getDecibels();
+
+    // --- NEW PRECISE FORMULA ---
+    // 1. AQI Component: Very low impact if under 50
+    float aqi_p = (currentAQI <= 50) ? (currentAQI / 5.0) : (10 + (currentAQI - 50) * 0.5);
+    
+    // 2. Noise Component: Only impacts if > 55dB
+    float noise_p = (currentDB > 55) ? (currentDB - 55) * 0.8 : 0;
+    
+    // 3. Temp Component: Only impacts if > 28C
+    float temp_p = (currentTemp > 28) ? (currentTemp - 28) * 3.0 : 0;
+
+    exposureScore = constrain((int)(aqi_p + noise_p + temp_p), 0, 100);
+
+    // Risk Logic (Preserved)
+    if (exposureScore > 45) {
+      if (!inHighExposure) { highExposureStartMillis = millis(); inHighExposure = true; }
+      float mins = (millis() - highExposureStartMillis) / 60000.0;
+      cumulativeRisk += (0.5 + pow(mins, 1.5)); 
+    } else {
+      inHighExposure = false;
+      cumulativeRisk -= 1.0; 
+    }
+    cumulativeRisk = constrain(cumulativeRisk, 0, 100);
+
+    // Standardized Serial Output for Dashboard
+    Serial.print("AQI:"); Serial.print(currentAQI);
+    Serial.print(",TEMP:"); Serial.print(currentTemp);
+    Serial.print(",DB:"); Serial.print((int)currentDB);
+    Serial.print(",SCORE:"); Serial.print(exposureScore);
+    Serial.print(",RISK:"); Serial.println((int)cumulativeRisk); 
+  }
+
+  // --- UI SEQUENCER (PRESERVED) ---
+  unsigned long elapsed = (currentMillis - sequencerStart) % cycleTotal;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  if (elapsed < 5000) { 
+    display.println("AIR QUALITY (AQI)");
+    display.setTextSize(3); display.setCursor(35, 30); display.print(currentAQI);
+  } else if (elapsed < 10000) { 
+    display.println("NOISE LEVEL (dB)");
+    display.setTextSize(3); display.setCursor(35, 30); display.print((int)currentDB);
+  } else if (elapsed < 15000) { 
+    display.println("TEMPERATURE (C)");
+    display.setTextSize(3); display.setCursor(25, 30); display.print(currentTemp, 1);
+  } else { 
+    display.println("EXPOSURE RISK");
+    display.drawLine(0, 12, 128, 12, WHITE);
+    display.setTextSize(4); display.setCursor(35, 25); display.print(exposureScore);
+    display.setTextSize(1); display.setCursor(0, 55);
+    display.print("DOSAGE: "); display.print((int)cumulativeRisk); display.print("%");
+  }
+  display.display();
+}
